@@ -32,7 +32,8 @@ use app_crypto::{ed25519, sr25519};
 use keyring::AccountKeyring;
 use keystore::Store;
 use std::path::PathBuf;
-
+use std::fs;
+use std::io::Write;
 use base58::{FromBase58, ToBase58};
 use blake2_rfc::blake2s::blake2s;
 use clap::{Arg, ArgMatches};
@@ -45,30 +46,36 @@ use sr_primitives::{
     traits::{IdentifyAccount, Verify},
     MultiSignature,
 };
-
+use serde_json::{Map, Value};
 use std::sync::mpsc::channel;
 use std::thread;
 
 use substrate_api_client::{
-    compose_extrinsic,
+    compose_extrinsic, compose_extrinsic_offline,
+    extrinsic::xt_primitives::UncheckedExtrinsicV4,
     extrinsic::xt_primitives::GenericAddress,
     node_metadata,
     utils::{hexstr_to_u256, hexstr_to_u64, hexstr_to_vec},
-    Api,
+    Api, XtStatus,
 };
 use substratee_node_runtime::{
     substratee_registry::{Enclave, Request},
-    AccountId, Event, Hash, Signature,
+    AccountId, Event, Hash, Signature, BalancesCall, Call
 };
 use substratee_stf::{
     cli::get_identifiers, ShardIdentifier, TrustedCallSigned, TrustedGetterSigned,
     TrustedOperationSigned,
 };
 use substratee_worker_api::Api as WorkerApi;
+use std::collections::HashMap;
+use std::cmp;
 
 type AccountPublic = <Signature as Verify>::Signer;
 const KEYSTORE_PATH: &str = "my_keystore";
+const NONCE_FILE: &str = "nonces.json";
 const PREFUNDING_AMOUNT: u128 = 1_000_000_000;
+
+//type NonceStore = HashMap<Vec<u8>, Vec<u8>>;
 
 fn main() {
     env_logger::init();
@@ -177,7 +184,7 @@ fn main() {
                         "[+] Alice is generous and pre funds account {}\n",
                         accountid.to_ss58check()
                     );
-                    let tx_hash = _api.send_extrinsic(xt.hex_encode()).unwrap();
+                    let tx_hash = _api.send_extrinsic(xt.hex_encode(), XtStatus::Ready).unwrap();
                     info!(
                         "[+] Pre-Funding transaction got finalized. Hash: {:?}\n",
                         tx_hash
@@ -244,13 +251,25 @@ fn main() {
                     let amount = u128::from_str_radix(matches.value_of("amount").unwrap(), 10)
                         .expect("amount can be converted to u128");
                     let from = get_pair_from_str(arg_from);
+                    let fromid = get_accountid_from_str(arg_from);
                     let to = get_accountid_from_str(arg_to);
                     info!("from ss58 is {}", from.public().to_ss58check());
                     info!("to ss58 is {}", to.to_ss58check());
                     let _api = api.clone().set_signer(sr25519_core::Pair::from(from));
-                    let xt = _api.balance_transfer(GenericAddress::from(to.clone()), amount);
-                    let tx_hash = _api.send_extrinsic(xt.hex_encode()).unwrap();
-                    println!("[+] Transaction got finalized. Hash: {:?}\n", tx_hash);
+
+                    let nonce = get_nonce(&_api, &fromid);
+                    debug!("sending transfer extrinsic with nonce {}", nonce);
+                    //let xt = _api.balance_transfer(GenericAddress::from(to.clone()), amount);
+                    let xt: UncheckedExtrinsicV4<_> = compose_extrinsic_offline!(
+                        _api.clone().signer.unwrap(),
+                        Call::Balances(BalancesCall::transfer(to.clone().into(), amount)),
+                        nonce,
+                        api.genesis_hash,
+                        api.runtime_version.spec_version
+                    );
+
+                    let tx_hash = _api.send_extrinsic(xt.hex_encode(), XtStatus::Ready).unwrap();
+                    println!("[+] Transaction sent. not waiting for finalization");
                     let result = _api.get_free_balance(&to);
                     println!("balance for {} is now {}", to, result);
                     Ok(())
@@ -337,6 +356,40 @@ fn perform_trusted_operation(matches: &ArgMatches<'_>, top: &TrustedOperationSig
     };
 }
 
+// get latest nonce. use local cache for bulk sending
+fn get_nonce(api: &Api<sr25519::Pair>, account: &AccountId) -> u32 {
+    let chain_nonce = api.get_nonce().unwrap();
+    debug!("chain nonce = {}", chain_nonce);
+    let path = PathBuf::from(format!("{}/{}", KEYSTORE_PATH, NONCE_FILE));
+
+    // Open the path in read-only mode, returns `io::Result<File>`
+    let mut nonces = match fs::read_to_string(path.clone()) {
+        Ok(val) => {
+            let parsed: Value = serde_json::from_str(&val).unwrap();
+            let obj : Map::<String, Value> = parsed.as_object().unwrap().clone();
+            obj
+        },
+        Err(_) => {
+            serde_json::Map::<String, Value>::new()
+        }
+    };
+
+    let stored_nonce: u32 = match nonces.get(&account.to_ss58check()) {
+        Some(n) => n.as_u64().unwrap() as u32,
+        None => 0,
+    };
+    debug!("stored nonce = {}", stored_nonce);
+    let nonce = cmp::max(chain_nonce, stored_nonce+1);
+
+    nonces.insert(account.to_ss58check(), Value::from(nonce));
+
+    // store new nonce
+    let mut buffer = fs::File::create(&path).unwrap();
+    buffer.write_all(serde_json::to_string_pretty(&nonces).unwrap().as_bytes()).unwrap();
+    debug!("stored new nonce = {}", nonce);
+    nonce
+ }
+
 //FIXME: even better would be if the interpretation of the getter result is left to the stf crate
 // here we assume that the getter result is a u128, but how should we now here in this crate?
 fn get_state(matches: &ArgMatches<'_>, getter: TrustedGetterSigned) {
@@ -360,6 +413,7 @@ fn get_state(matches: &ArgMatches<'_>, getter: TrustedGetterSigned) {
         _ => error!("error getting value"),
     };
 }
+
 fn send_request(matches: &ArgMatches<'_>, call: TrustedCallSigned) {
     let chain_api = get_chain_api(matches);
     let worker_api = get_worker_api(matches);
@@ -408,7 +462,7 @@ fn send_request(matches: &ArgMatches<'_>, call: TrustedCallSigned) {
     );
 
     // send and watch extrinsic until finalized
-    let tx_hash = _chain_api.send_extrinsic(xt.hex_encode()).unwrap();
+    let tx_hash = _chain_api.send_extrinsic(xt.hex_encode(), XtStatus::Ready).unwrap();
     info!("stf call extrinsic got finalized. Hash: {:?}", tx_hash);
     info!("waiting for confirmation of stf call");
     let act_hash = subscribe_to_call_confirmed(_chain_api.clone());
