@@ -74,7 +74,7 @@ features = ["dangerous_configuration"]
 
 #[dependencies.jsonrpc-core]
 #git = "https://github.com/scs/jsonrpc"
-#branch = "601/no-std-core"
+#branch = "no_std"
 #default-features = false
 
 [dependencies.sp-io]
@@ -155,3 +155,6 @@ sp-io = { tag = "v0.7.0", git = "https://github.com/scs/sgx-runtime", default-fe
 #sgx-runtime = { path = "../../sgx-runtime/runtime", default-features = false }
 #sp-io = { path = "../../sgx-runtime/substrate-sgx/sp-io", default-features = false, features = ["disable_oom", "disable_panic_handler", "disable_allocator", "sgx"]}
 #sgx-externalities = { path = "../../sgx-runtime/substrate-sgx/externalities", default-features = false}
+
+[patch."https://github.com/scs/jsonrpc"]
+jsonrpc-core = { path = "../../jsonrpc-fork/core"}
