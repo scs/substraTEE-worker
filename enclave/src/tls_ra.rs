@@ -26,13 +26,14 @@ impl ClientAuth {
 }
 
 impl rustls::ClientCertVerifier for ClientAuth {
-    fn client_auth_root_subjects(&self) -> rustls::DistinguishedNames {
-        rustls::DistinguishedNames::new()
+    fn client_auth_root_subjects(&self, _sni: Option<&webpki::DNSName>) -> Option<rustls::DistinguishedNames> {
+        Some(rustls::DistinguishedNames::new())
     }
 
     fn verify_client_cert(
         &self,
         _certs: &[rustls::Certificate],
+        _sni: Option<&webpki::DNSName>
     ) -> Result<rustls::ClientCertVerified, rustls::TLSError> {
         debug!("client cert: {:?}", _certs);
         // This call will automatically verify cert is properly signed
